@@ -3,8 +3,9 @@ robot_toolkit.py  -  LA "SCATOLA NERA" DEL ROBOT
 
 Questo file NON fa parte della lezione: contiene tutto cio' che serve per far
 funzionare il robot ma che non riguarda l'intelligenza artificiale:
-camera (Picamera2), modello di rilevamento (TensorFlow Lite / Coral), motori,
-finestra di anteprima OpenCV e streaming video via Flask.
+camera (Picamera2), modello di rilevamento (TensorFlow Lite / Coral), motori
+(driver L298N), finestra di anteprima OpenCV e streaming video via Flask.
+E' autonomo: non usa common.py ne' util.py (le parti utili sono qui dentro).
 
 Gli studenti lo usano soltanto cosi':
 
@@ -25,8 +26,9 @@ Basato su "AI Robot - Human Following" di Jitesh Saini
 (https://github.com/jiteshsaini, https://helloworld.co.in)
 """
 import os
-import sys
 import time
+import glob
+import ctypes
 import signal
 import socket
 from datetime import datetime
@@ -49,12 +51,12 @@ from PIL import Image
 from picamera2 import Picamera2
 from flask import Flask, Response, render_template
 import RPi.GPIO as GPIO
+import re
+import collections
+import numpy as np
+import ai_edge_litert.interpreter as tflite
 
-import common as cm
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
-import util as ut
-from util import edgetpu   # il Coral viene rilevato automaticamente da util.py
+GPIO.setwarnings(False)
 
 
 # Liberiamo camera e pin, come fa master.py del pannello di controllo:
@@ -78,26 +80,27 @@ def _su_sigterm(signum, frame):
 signal.signal(signal.SIGTERM, _su_sigterm)
 
 
-# Precauzione GPIO (RPi.GPIO = rpi-lgpio su Bookworm/Trixie): un'uscita senza
-# 'initial' viene prima letta, e la lettura di un pin non ancora nostro fallisce.
-# Forziamo initial=LOW per tutte le uscite (anche quelle di util.init_gpio):
-# motori fermi all'avvio.
-_gpio_setup_originale = GPIO.setup
-
-
-def _gpio_setup_compat(canale, direzione, *args, **kwargs):
-    if direzione == GPIO.OUT and len(args) < 2 and kwargs.get('initial') is None:
-        kwargs['initial'] = GPIO.LOW
-    return _gpio_setup_originale(canale, direzione, *args, **kwargs)
-
-
-GPIO.setup = _gpio_setup_compat
-
-ut.init_gpio()
-
 # ---------------------------------------------------------------------------
 # Impostazioni di sistema (gli studenti non devono toccarle)
 # ---------------------------------------------------------------------------
+
+# ---- Collegamento Raspberry Pi -> driver L298N (numeri GPIO "BCM") ---------
+# Sono gli stessi pin di util.py del progetto originale, cosi' anche il
+# pannello di controllo continua a funzionare senza ricablare nulla.
+# Schema completo con i numeri dei pin fisici: vedi README.md.
+#
+#   Ruota SINISTRA = motore A del L298N (uscite OUT1/OUT2)
+PIN_SINISTRA_AVANTI = 8          # -> IN1   (pin fisico 24)
+PIN_SINISTRA_INDIETRO = 11       # -> IN2   (pin fisico 23)
+PIN_ENABLE_SINISTRA = 20         # -> ENA   (pin fisico 38)
+#   Ruota DESTRA = motore B del L298N (uscite OUT3/OUT4)
+PIN_DESTRA_INDIETRO = 14         # -> IN3   (pin fisico 8)
+PIN_DESTRA_AVANTI = 15           # -> IN4   (pin fisico 10)
+PIN_ENABLE_DESTRA = 21           # -> ENB   (pin fisico 40)
+#
+# Se una ruota gira al contrario: inverti i due fili del motore sulle uscite
+# OUTx del L298N (oppure scambia qui i due numeri AVANTI/INDIETRO di quella ruota).
+
 DIMENSIONI_FRAME = (640, 480)
 
 # Orientamento della camera. None = come il pannello di controllo: legge
@@ -120,18 +123,15 @@ LOG_TERMINALE = True
 LOG_CSV = True
 OGGETTO_DA_SEGUIRE = 'person'
 
-DIR_MODELLI = './modelli'
+DIR_MODELLI = '/var/www/html/all_models'
 MODELLO = 'mobilenet_ssd_v2_coco_quant_postprocess.tflite'
 MODELLO_EDGETPU = 'mobilenet_ssd_v2_coco_quant_postprocess_edgetpu.tflite'
 ETICHETTE = 'coco_labels.txt'
 
-# Motori (IBT-2). La velocita' e' un PWM sugli ingressi RPWM/LPWM, cioe' sui
-# pin di direzione di util.py (m1_1/m1_2 e m2_1/m2_2): e' il modo standard di
-# pilotare l'IBT-2. Verso di marcia e quale ruota e' la sinistra vengono
-# ricavati da util.forward() e util.left(), identici al pannello di controllo.
-# Gli enable (R_EN + L_EN) restano sempre ALTI: funziona sia se sono collegati
-# ai GPIO qui sotto, sia se sono fissi a 5 V.
-PIN_ENABLE = (20, 21)            # GPIO degli enable (tenuti alti)
+# Come si comandano i motori: la velocita' e' un PWM sugli ingressi IN1..IN4
+# (il pin "avanti" o "indietro" della ruota), mentre ENA/ENB restano sempre
+# ALTI. Funziona sia con ENA/ENB collegati ai GPIO 20/21, sia lasciando sul
+# L298N i ponticelli (jumper) sopra ENA/ENB.
 FREQ_PWM = 100                   # Hz
 
 # Sotto una certa percentuale di PWM i motori ronzano ma non girano.
@@ -152,6 +152,174 @@ QUALITA_JPEG = 80
 
 
 # ---------------------------------------------------------------------------
+# Impostazioni del pannello di controllo (config.txt) - era in util.py
+# ---------------------------------------------------------------------------
+_CARTELLA = os.path.dirname(os.path.realpath(__file__))
+# config.txt si cerca accanto a questo file, poi nella cartella superiore
+# (earthrover/config.txt, quella scritta dal pannello di controllo)
+_FILE_CONFIG = [os.path.join(_CARTELLA, "config.txt"),
+                os.path.join(os.path.dirname(_CARTELLA), "config.txt")]
+
+
+def _impostazione(chiave, predefinito):
+    """Un valore 'chiave=valore' da config.txt; se manca, il predefinito."""
+    for percorso in _FILE_CONFIG:
+        try:
+            with open(percorso) as f:
+                for riga in f:
+                    k, _, v = riga.partition("=")
+                    if k.strip() == chiave:
+                        return type(predefinito)(v.strip())
+        except (OSError, ValueError):
+            continue
+    return predefinito
+
+
+# ---------------------------------------------------------------------------
+# Coral USB Accelerator: rilevato automaticamente - era in util.py
+# Vale 1 solo se la chiavetta e' collegata E la sua libreria e' installata.
+# Per forzare: variabile d'ambiente EARTHROVER_EDGETPU=0 (CPU) oppure =1 (Coral).
+# ---------------------------------------------------------------------------
+_LIB_EDGETPU = 'libedgetpu.so.1'
+_ID_CORAL = {("1a6e", "089a"), ("18d1", "9302")}   # prima e dopo il caricamento del firmware
+
+
+def _coral_presente():
+    ids = set(_ID_CORAL)
+    # altri ID eventualmente dichiarati dalle regole udev di libedgetpu
+    modello = re.compile(r'idVendor}=="([0-9a-fA-F]{4})".*?idProduct}=="([0-9a-fA-F]{4})"')
+    for cartella in ("/usr/lib/udev/rules.d", "/lib/udev/rules.d", "/etc/udev/rules.d"):
+        for regole in glob.glob(cartella + "/*edgetpu*.rules"):
+            try:
+                with open(regole) as f:
+                    ids.update((v.lower(), p.lower()) for v, p in modello.findall(f.read()))
+            except OSError:
+                pass
+    # dispositivi USB collegati (letti da /sys, senza bisogno di lsusb)
+    for file_vendor in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            with open(file_vendor) as f:
+                vid = f.read().strip().lower()
+            with open(file_vendor[:-len("idVendor")] + "idProduct") as f:
+                pid = f.read().strip().lower()
+        except OSError:
+            continue
+        if (vid, pid) in ids:
+            try:
+                ctypes.CDLL(_LIB_EDGETPU)      # la libreria c'e'?
+                return True
+            except OSError:
+                return False                   # chiavetta presente, libreria mancante
+    return False
+
+
+_forza_coral = os.environ.get("EARTHROVER_EDGETPU")
+edgetpu = int(_forza_coral) if _forza_coral in ("0", "1") else int(_coral_presente())
+
+
+# ---------------------------------------------------------------------------
+# Pin dei motori bassi appena il toolkit viene importato: motori fermi
+# (anche durante le prove di camera e rete neurale).
+# ---------------------------------------------------------------------------
+_PIN_DIREZIONE = (PIN_SINISTRA_AVANTI, PIN_SINISTRA_INDIETRO,
+                  PIN_DESTRA_AVANTI, PIN_DESTRA_INDIETRO)
+_PIN_ENABLE = (PIN_ENABLE_SINISTRA, PIN_ENABLE_DESTRA)
+
+GPIO.setmode(GPIO.BCM)
+for _pin in _PIN_DIREZIONE:
+    # initial=LOW e' importante: senza, rpi-lgpio prova a leggere il pin prima
+    # di averlo preso e fallisce con "lgpio.error: 'GPIO not allocated'"
+    GPIO.setup(_pin, GPIO.OUT, initial=GPIO.LOW)
+
+
+def _motori_off():
+    """Tutti gli ingressi del L298N bassi: ruote ferme."""
+    for pin in _PIN_DIREZIONE:
+        try:
+            GPIO.output(pin, False)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Rete neurale (TensorFlow Lite / LiteRT, con o senza Coral)
+# Era common.py del progetto originale: ora e' qui dentro.
+# ---------------------------------------------------------------------------
+
+# Un oggetto rilevato: classe, confidenza, riquadro normalizzato 0..1
+_Oggetto = collections.namedtuple('Oggetto', ['id', 'score', 'bbox'])
+_BBox = collections.namedtuple('BBox', ['xmin', 'ymin', 'xmax', 'ymax'])
+
+
+def _carica_etichette(percorso):
+    """coco_labels.txt -> {numero_classe: nome}, es. {0: 'person', ...}"""
+    riga_valida = re.compile(r'\s*(\d+)(.+)')
+    etichette = {}
+    with open(percorso, 'r', encoding='utf-8') as f:
+        for riga in f:
+            m = riga_valida.match(riga)
+            if m:
+                etichette[int(m.group(1))] = m.group(2).strip()
+    return etichette
+
+
+def _carica_modello(cartella, modello, file_etichette, usa_coral):
+    """Crea l'interprete TFLite (sul Coral se usa_coral == 1) e carica le etichette."""
+    percorso_modello = os.path.join(cartella, modello)
+    percorso_etichette = os.path.join(cartella, file_etichette)
+    print("Modello: {}  ({})".format(percorso_modello, "Coral" if usa_coral else "CPU"))
+
+    if usa_coral:
+        interprete = tflite.Interpreter(
+            model_path=percorso_modello,
+            experimental_delegates=[tflite.load_delegate(_LIB_EDGETPU, {})])
+    else:
+        interprete = tflite.Interpreter(model_path=percorso_modello)
+    interprete.allocate_tensors()
+    return interprete, _carica_etichette(percorso_etichette)
+
+
+def _imposta_ingresso(interprete, immagine_pil):
+    """Ridimensiona la foto alla dimensione di ingresso della rete e la copia dentro."""
+    _, altezza, larghezza, _ = interprete.get_input_details()[0]['shape']
+    immagine = immagine_pil.resize((larghezza, altezza), Image.NEAREST)
+    indice = interprete.get_input_details()[0]['index']
+    interprete.tensor(indice)()[0][:, :] = immagine
+
+
+def _tensore_uscita(interprete, i):
+    """Uscita i-esima della rete, riportata a numeri reali se quantizzata."""
+    dettagli = interprete.get_output_details()[i]
+    dati = np.squeeze(interprete.tensor(dettagli['index'])())
+    if 'quantization' not in dettagli:
+        return dati
+    scala, zero = dettagli['quantization']
+    if scala == 0:
+        return dati - zero
+    return scala * (dati - zero)
+
+
+def _leggi_oggetti(interprete, soglia, max_oggetti):
+    """Elenco degli oggetti rilevati con confidenza >= soglia (modello SSD MobileNet)."""
+    riquadri = _tensore_uscita(interprete, 0)
+    classi = _tensore_uscita(interprete, 1)
+    punteggi = _tensore_uscita(interprete, 2)
+    quanti = int(_tensore_uscita(interprete, 3))
+
+    oggetti = []
+    for i in range(min(max_oggetti, quanti)):
+        if punteggi[i] < soglia:
+            continue
+        ymin, xmin, ymax, xmax = riquadri[i]
+        oggetti.append(_Oggetto(
+            id=int(classi[i]),
+            score=float(punteggi[i]),
+            bbox=_BBox(xmin=max(0.0, float(xmin)), ymin=max(0.0, float(ymin)),
+                       xmax=min(1.0, float(xmax)), ymax=min(1.0, float(ymax)))))
+    return oggetti
+
+
+# ---------------------------------------------------------------------------
 # Camera
 # ---------------------------------------------------------------------------
 _FLIP = {"none": (0, 0), "rotate_180": (1, 1),        # (hflip, vflip)
@@ -168,10 +336,9 @@ def _apri_camera():
 
     if ORIENTAMENTO_CAMERA is not None:
         orientamento, origine = ORIENTAMENTO_CAMERA, "ORIENTAMENTO_CAMERA nel toolkit"
-    elif hasattr(ut, "setting"):
-        orientamento, origine = ut.setting("flip_RPI_cam", "none"), "config.txt (pannello: Orientation)"
     else:
-        orientamento, origine = "none", "predefinito"
+        orientamento = _impostazione("flip_RPI_cam", "none")
+        origine = "config.txt (pannello: Orientation)"
     if orientamento not in _FLIP:
         print("Orientamento '{}' sconosciuto: uso 'none'".format(orientamento))
         orientamento = "none"
@@ -191,75 +358,40 @@ def _apri_camera():
 # ---------------------------------------------------------------------------
 # Motori: direzione e velocita' indipendenti per ruota sinistra e destra
 # ---------------------------------------------------------------------------
-def _livelli_di(funzione):
-    """
-    Esegue una funzione di util.py (es. ut.forward) SENZA toccare i pin:
-    restituisce i livelli {pin: True/False} che avrebbe impostato.
-    """
-    livelli = {}
-    originale = GPIO.output
-    GPIO.output = lambda canale, valore: livelli.__setitem__(canale, bool(valore))
-    try:
-        funzione()
-    finally:
-        GPIO.output = originale
-    return livelli
-
-
 class _Motori:
     """
-    Pilota le due ruote separatamente.
-    Ogni ruota ha due ingressi sull'IBT-2 (pin di util.py):
-      AVANTI    -> PWM sul pin che util.forward() mette alto, l'altro a 0
-      INDIETRO  -> PWM sull'altro pin
-      FRENO     -> entrambi a 0 (con gli enable alti l'IBT-2 frena)
+    Pilota le due ruote separatamente tramite il driver L298N.
+    Ogni ruota ha due ingressi (IN1/IN2 la sinistra, IN3/IN4 la destra):
+      AVANTI    -> PWM sul pin "avanti", l'altro a 0
+      INDIETRO  -> PWM sul pin "indietro", l'altro a 0
+      FRENO     -> entrambi a 0 (con ENA/ENB alti il L298N frena)
     Valore di una ruota: da -100 (indietro a tutta) a +100 (avanti a tutta), 0 = freno.
     """
 
     def __init__(self):
-        # --- direzioni: le leggiamo da util.py, senza muovere nulla ---------
-        avanti = _livelli_di(ut.forward)
-        a_sinistra = _livelli_di(ut.left)
-        motore_1 = (ut.m1_1, ut.m1_2, 1)
-        motore_2 = (ut.m2_1, ut.m2_2, 2)
-        for pin_a, pin_b, n in (motore_1, motore_2):
-            if pin_a not in avanti or pin_b not in avanti or avanti[pin_a] == avanti[pin_b]:
-                raise RuntimeError(
-                    "util.forward() non imposta in modo valido i pin del motore {}".format(n))
-        # Per girare a sinistra util.left() manda INDIETRO la ruota sinistra:
-        # e' il motore che, rispetto a forward(), ha il verso invertito.
-        if a_sinistra.get(motore_1[0]) != avanti[motore_1[0]]:
-            sx, dx = motore_1, motore_2
-        else:
-            sx, dx = motore_2, motore_1
-
         GPIO.setmode(GPIO.BCM)
 
-        # --- enable sempre alti -------------------------------------------
-        for pin in PIN_ENABLE:
-            GPIO.setup(pin, GPIO.OUT)
-            GPIO.output(pin, True)
+        # --- ENA / ENB sempre alti ------------------------------------------
+        for pin in _PIN_ENABLE:
+            GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH)
 
-        # --- PWM sugli ingressi di direzione --------------------------------
-        # (pin "avanti", pin "indietro") per ogni ruota, ricavati da forward()
-        self._pwm = {}
-        self._pin_info = {}
-        for lato, (pin_a, pin_b, n) in (("sx", sx), ("dx", dx)):
-            pin_av, pin_ind = (pin_a, pin_b) if avanti[pin_a] else (pin_b, pin_a)
-            self._pwm[lato] = (GPIO.PWM(pin_av, FREQ_PWM), GPIO.PWM(pin_ind, FREQ_PWM))
-            self._pin_info[lato] = (n, pin_av, pin_ind)
+        # --- PWM sugli ingressi IN1..IN4 ------------------------------------
+        self._pwm = {
+            "sx": (GPIO.PWM(PIN_SINISTRA_AVANTI, FREQ_PWM),
+                   GPIO.PWM(PIN_SINISTRA_INDIETRO, FREQ_PWM)),
+            "dx": (GPIO.PWM(PIN_DESTRA_AVANTI, FREQ_PWM),
+                   GPIO.PWM(PIN_DESTRA_INDIETRO, FREQ_PWM)),
+        }
         for coppia in self._pwm.values():
             for p in coppia:
                 p.start(0)
 
         self.duty = {"sx": 0.0, "dx": 0.0}     # ultimo PWM applicato (per i log)
-        i_sx, i_dx = self._pin_info["sx"], self._pin_info["dx"]
         self.descrizione = (
-            "Motori: SINISTRA = motore {} (avanti GPIO {}, indietro GPIO {})  |  "
-            "DESTRA = motore {} (avanti GPIO {}, indietro GPIO {})  |  "
-            "enable sempre alti su GPIO {}".format(
-                i_sx[0], i_sx[1], i_sx[2], i_dx[0], i_dx[1], i_dx[2],
-                "/".join(str(p) for p in PIN_ENABLE)))
+            "Motori (L298N): SINISTRA avanti GPIO {} / indietro GPIO {}, ENA GPIO {}  |  "
+            "DESTRA avanti GPIO {} / indietro GPIO {}, ENB GPIO {}".format(
+                PIN_SINISTRA_AVANTI, PIN_SINISTRA_INDIETRO, PIN_ENABLE_SINISTRA,
+                PIN_DESTRA_AVANTI, PIN_DESTRA_INDIETRO, PIN_ENABLE_DESTRA))
         print(self.descrizione)
         self.ferma()
 
@@ -312,11 +444,8 @@ class _Motori:
                         p.stop()
                     except Exception:
                         pass
-            try:
-                ut.stop()
-            except Exception:
-                pass
-            for pin in PIN_ENABLE:
+            _motori_off()
+            for pin in _PIN_ENABLE:
                 try:
                     GPIO.output(pin, False)
                 except Exception:
@@ -600,7 +729,7 @@ class Robot:
         # 1) modello (e' il passo piu' probabile a fallire: lo facciamo per primo,
         #    quando i motori sono ancora spenti)
         nome_modello = MODELLO_EDGETPU if edgetpu == 1 else MODELLO
-        self._interprete, self._etichette = cm.load_model(
+        self._interprete, self._etichette = _carica_modello(
             DIR_MODELLI, nome_modello, ETICHETTE, edgetpu)
 
         # 2) camera, con lo stesso orientamento del pannello di controllo
@@ -694,7 +823,7 @@ class Robot:
             if self._motori is not None:
                 self._motori.spegni()
             else:
-                ut.stop()
+                _motori_off()
         finally:
             _stream.chiudi()
             try:
@@ -733,10 +862,10 @@ class Robot:
         self._dur[0] = time.time() - t0
 
         t1 = time.time()
-        cm.set_input(self._interprete, pil)
+        _imposta_ingresso(self._interprete, pil)
         self._interprete.invoke()
-        self._oggetti = cm.get_output(
-            self._interprete, score_threshold=SOGLIA_CONFIDENZA, top_k=MAX_OGGETTI)
+        self._oggetti = _leggi_oggetti(
+            self._interprete, soglia=SOGLIA_CONFIDENZA, max_oggetti=MAX_OGGETTI)
         self._fine_inferenza = time.time()
         self._dur[1] = self._fine_inferenza - t1
 
@@ -878,7 +1007,10 @@ def prova_motori(lenta=20, veloce=100, secondi=3.0, passo_rampa=5):
     Verifica dei motori. SOLLEVA IL ROBOT: le ruote devono girare a vuoto.
       1) entrambe AVANTI, SINISTRA piano e DESTRA veloce
       2) entrambe AVANTI, SINISTRA veloce e DESTRA piano
-         -> una ruota va all'indietro        : inverti M+ e M- di quel motore
+         -> una ruota va all'indietro        : inverti i due fili di quel motore
+                                               sulle uscite OUTx del L298N
+         -> sinistra e destra scambiate      : scambia i cavi dei motori
+                                               (OUT1/OUT2 <-> OUT3/OUT4)
          -> la ruota "piano" non gira        : alza PWM_MINIMO
       3) rampa di PWM su entrambe (0 -> 100%): annota la % a cui le ruote
          iniziano DAVVERO a girare e mettila in PWM_MINIMO
@@ -899,8 +1031,9 @@ def prova_motori(lenta=20, veloce=100, secondi=3.0, passo_rampa=5):
         motori.ferma()
         time.sleep(1)
 
-        print("   Una ruota gira all'indietro     -> inverti M+ e M- su quell'IBT-2")
-        print("   Stessa velocita' su entrambe    -> controlla RPWM/LPWM sui GPIO di util.py")
+        print("   Una ruota gira all'indietro     -> inverti i due fili di quel motore (OUTx del L298N)")
+        print("   Sinistra e destra scambiate     -> scambia i motori: OUT1/OUT2 <-> OUT3/OUT4")
+        print("   Stessa velocita' su entrambe    -> controlla i fili IN1..IN4 (vedi README.md)")
         print("   La ruota 'piano' non gira       -> alza PWM_MINIMO (vedi rampa)")
 
         print("\n3) Rampa: annota la percentuale a cui le ruote iniziano a girare")
@@ -1010,7 +1143,7 @@ def prova_detection(soglia=SOGLIA_CONFIDENZA, max_oggetti=10, finestra=True, por
 
     nome_modello = MODELLO_EDGETPU if edgetpu == 1 else MODELLO
     backend = "Coral" if edgetpu == 1 else "CPU"
-    interprete, etichette = cm.load_model(DIR_MODELLI, nome_modello, ETICHETTE, edgetpu)
+    interprete, etichette = _carica_modello(DIR_MODELLI, nome_modello, ETICHETTE, edgetpu)
 
     camera = _prova_apri_camera()
     _avvia_flask(porta)
@@ -1026,9 +1159,9 @@ def prova_detection(soglia=SOGLIA_CONFIDENZA, max_oggetti=10, finestra=True, por
             t_cam = time.time() - t0
 
             t1 = time.time()
-            cm.set_input(interprete, pil)
+            _imposta_ingresso(interprete, pil)
             interprete.invoke()
-            oggetti = cm.get_output(interprete, score_threshold=soglia, top_k=max_oggetti)
+            oggetti = _leggi_oggetti(interprete, soglia=soglia, max_oggetti=max_oggetti)
             t_inf = time.time() - t1
 
             adesso = time.time()
