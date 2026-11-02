@@ -1,163 +1,1152 @@
 """
-inseguitore.py  -  L'ALGORITMO DEL ROBOT INSEGUITORE
+robot_toolkit.py  -  LA "SCATOLA NERA" DEL ROBOT
 
-Obiettivo: il robot deve SEGUIRE una persona, avanzando in modo continuo,
-e fermarsi quando le e' abbastanza vicino.
+Questo file NON fa parte della lezione: contiene tutto cio' che serve per far
+funzionare il robot ma che non riguarda l'intelligenza artificiale:
+camera (Picamera2), modello di rilevamento (TensorFlow Lite / Coral), motori,
+finestra di anteprima OpenCV e streaming video via Flask.
 
-Tutto cio' che non riguarda l'intelligenza artificiale (camera, motori, rete
-neurale, streaming video) e' nascosto dentro robot_toolkit.py.
-Qui dentro c'e' solo la parte interessante: DECIDERE cosa fare.
+Gli studenti lo usano soltanto cosi':
 
-Come funziona un robot "intelligente" (il ciclo SENSE - THINK - ACT):
+    from robot_toolkit import Robot
 
-    1. PERCEPIRE  : la camera scatta una foto e una rete neurale cerca le
-                    persone  ->  robot.cerca_persona()
-    2. DECIDERE   : il NOSTRO algoritmo guarda dove si trova la persona
-                    nell'immagine e sceglie la velocita' delle due ruote
-                    ->  decidi_e_muovi()
-    3. AGIRE      : i motori eseguono  ->  robot.muovi(sinistra, destra)
-    4. RIPETERE   : piu' volte al secondo
-
-Come sterza il robot?
-    Non ha un volante: ha due ruote motrici, una a sinistra e una a destra
-    (come un carro armato). Per curvare basta farle girare a velocita' diverse:
-        sinistra = destra          -> va dritto
-        destra piu' veloce         -> curva a SINISTRA
-        sinistra piu' veloce       -> curva a DESTRA
-"""
-from robot_toolkit import Robot
-
-# ---------------------------------------------------------------------------
-# PARAMETRI DELL'ALGORITMO  (provate a cambiarli e osservate cosa succede!)
-# ---------------------------------------------------------------------------
-
-# Velocita' di crociera, in percentuale (0..100).
-#   - troppo alta -> tra una foto e l'altra il robot fa troppa strada "alla
-#                    cieca" e perde la persona
-#   - troppo bassa -> il robot e' lento ad inseguire
-VELOCITA = 30
-
-# GUADAGNO: quanto "forte" sterza il robot per ogni unita' di errore.
-# E' il cuore di un CONTROLLO PROPORZIONALE: piu' la persona e' lontana dal
-# centro dell'immagine, piu' il robot sterza. Poco fuori centro = curva dolce.
-#   - troppo alto  -> il robot sterza troppo, supera la persona e zigzaga
-#   - troppo basso -> il robot curva troppo poco e la persona esce dall'immagine
-GUADAGNO = 30
-
-# Sterzata massima: anche se la persona e' al bordo dell'immagine, la curva
-# non diventa mai piu' stretta di cosi'. Con VELOCITA = 30 e STERZATA_MAX = 10
-# le ruote vanno al massimo 20% e 40%: curva decisa ma senza girare su se stesso.
-STERZATA_MAX = 10
-
-# Zona morta: se la persona e' entro questa distanza dal centro la
-# consideriamo centrata e andiamo dritti (niente piccole correzioni inutili).
-# E' una frazione della larghezza dell'immagine: 0.05 = +-5%
-# (riquadro verde nel video).
-TOLLERANZA = 0.05
-
-# Come capiamo che la persona e' vicina? Piu' una persona e' vicina alla
-# camera, piu' GRANDE appare nell'immagine. Misuriamo quanta parte
-# dell'immagine occupa il suo riquadro (area = altezza x larghezza):
-#     0.05 -> persona piccola, lontana
-#     0.30 -> persona a qualche passo
-#     0.70 -> la persona riempie quasi tutta l'immagine: siamo arrivati
-# Nel video e' il valore "A" in basso, che diventa verde oltre la soglia.
-# Per tararla: mettetevi alla distanza a cui il robot si deve fermare e
-# leggete il valore AREA nel log del terminale.
-SOGLIA_VICINO = 0.70
-
-
-# ---------------------------------------------------------------------------
-# FUNZIONI DELL'ALGORITMO
-# ---------------------------------------------------------------------------
-
-def calcola_sterzata(errore):
-    """
-    Trasforma l'errore (quanto la persona e' fuori centro) in una sterzata.
-
-        sterzata = GUADAGNO * errore
-
-    Con GUADAGNO = 30:
-        errore = 0.10 (poco fuori centro)       ->  sterzata  3  (curva dolce)
-        errore = 0.30 (molto fuori centro)      ->  sterzata  9
-        errore = 0.45 (al bordo)                ->  27, ma limitata a STERZATA_MAX
-        errore negativo (persona a destra)      ->  sterzata negativa
-
-    Dentro la zona morta (TOLLERANZA) la sterzata e' zero: andiamo dritti.
-    """
-    if abs(errore) < TOLLERANZA:
-        return 0
-    sterzata = GUADAGNO * errore
-    # limite: min/max "tagliano" il valore tra -STERZATA_MAX e +STERZATA_MAX
-    return max(-STERZATA_MAX, min(STERZATA_MAX, sterzata))
-
-
-def decidi_e_muovi(robot, persona):
-    """
-    IL CERVELLO DEL ROBOT.
-
-    Riceve:
-      robot    : per comandare i motori
-      persona  : la persona vista dalla camera, oppure None se non c'e' nessuno.
-                 Se c'e', ha questi valori utili (tutti tra 0 e 1):
-                    persona.errore_x : > 0 persona a SINISTRA
-                                       < 0 persona a DESTRA
-                                       vicino a 0 = persona al centro
-                    persona.area     : quanta immagine occupa (vicino a 1 = persona vicina)
-
-    Restituisce una stringa che descrive cosa sta facendo (finisce nel log,
-    insieme alla velocita' delle ruote).
-    """
-
-    # --- REGOLA 1: se non vedo nessuno, mi fermo --------------------------
-    # Meglio fermi che correre alla cieca: e' la scelta piu' sicura.
-    if persona is None:
-        robot.ferma()
-        return "non vista: fermo"
-
-    # --- REGOLA 2: se la persona riempie quasi tutta l'immagine, mi fermo --
-    # Abbiamo raggiunto l'obiettivo: restiamo fermi.
-    if persona.area > SOGLIA_VICINO:
-        robot.ferma()
-        return "arrivato: fermo"
-
-    # --- REGOLA 3: avanzo sterzando verso la persona ----------------------
-    # La sterzata toglie velocita' a una ruota e la aggiunge all'altra.
-    # Persona a SINISTRA (errore > 0, sterzata > 0):
-    #     la ruota sinistra rallenta, la destra accelera -> curva a sinistra
-    # Persona a DESTRA (errore < 0, sterzata < 0): il contrario.
-    # Persona al centro (sterzata = 0): le ruote vanno uguali -> dritto.
-    sterzata = calcola_sterzata(persona.errore_x)
-
-    sinistra = VELOCITA - sterzata
-    destra = VELOCITA + sterzata
-
-    # Il comando resta attivo fino al prossimo giro del ciclo, quando la
-    # situazione verra' rivalutata con una foto nuova: il robot non si ferma
-    # mai tra una decisione e l'altra, quindi il movimento e' fluido.
-    robot.muovi(sinistra, destra)
-
-    return "inseguo"
-
-
-# ---------------------------------------------------------------------------
-# PROGRAMMA PRINCIPALE: il ciclo  PERCEPIRE -> DECIDERE -> AGIRE
-# ---------------------------------------------------------------------------
-if __name__ == '__main__':
-
-    # "with" si occupa di spegnere i motori e chiudere la camera anche in caso
-    # di errore o di Ctrl+C: non dobbiamo preoccuparcene.
     with Robot() as robot:
-
-        # robot.attivo() diventa False quando si preme 'q' nella finestra video
         while robot.attivo():
+            persona = robot.cerca_persona()      # "gli occhi"
+            ...                                  # <-- il loro algoritmo
+            robot.muovi(sinistra, destra) / robot.ferma()   # "le gambe"
+            robot.mostra(azione, tolleranza, soglia_vicino)   # video
 
-            # 1. PERCEPIRE: la rete neurale cerca una persona nella foto
-            persona = robot.cerca_persona()
+Prove dell'hardware (motori, camera, rete neurale): vedi in fondo al file.
 
-            # 2. DECIDERE e 3. AGIRE: il nostro algoritmo comanda i motori
-            azione = decidi_e_muovi(robot, persona)
+Pagina web con la vista del robot:  http://<ip-del-robot>:2204/
 
-            # 4. Mostriamo cosa ha capito il robot (finestra e pagina web).
-            #    Passiamo i parametri per vedere le linee guida nel video.
-            robot.mostra(azione, TOLLERANZA, SOGLIA_VICINO)
+Basato su "AI Robot - Human Following" di Jitesh Saini
+(https://github.com/jiteshsaini, https://helloworld.co.in)
+"""
+import os
+import sys
+import time
+import signal
+import socket
+from datetime import datetime
+import logging
+from dataclasses import dataclass
+from threading import Thread, Condition
+
+# --- messaggi di sistema superflui (impostati PRIMA di importare camera e OpenCV)
+# libcamera: solo errori, niente INFO/WARN ad ogni avvio
+os.environ.setdefault("LIBCAMERA_LOG_LEVELS", "*:ERROR")
+# OpenCV da pip include Qt senza plugin wayland e senza font: usiamo X11 (xcb)
+# e i font di sistema, cosi' spariscono gli avvisi "qt.qpa.plugin" e "QFontDatabase"
+if os.environ.get("DISPLAY"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+if os.path.isdir("/usr/share/fonts/truetype/dejavu"):
+    os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
+
+import cv2
+from PIL import Image
+from picamera2 import Picamera2
+from flask import Flask, Response, render_template
+import RPi.GPIO as GPIO
+import re
+import collections
+import numpy as np
+import ai_edge_litert.interpreter as tflite
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import util as ut
+from util import edgetpu   # il Coral viene rilevato automaticamente da util.py
+
+
+# Liberiamo camera e pin, come fa master.py del pannello di controllo:
+#   cam_server.py   -> tiene occupata la camera (stream del pannello)
+#   generate_pwm.py -> tiene occupati GPIO 20-21 (slider di velocita')
+# Un pin GPIO puo' avere un solo proprietario: se un altro programma lo tiene,
+# GPIO.setup fallisce con "lgpio.error: 'GPIO not allocated'".
+# Se lanciato da master.py questi programmi sono gia' fermi e il comando non fa nulla.
+for _prog in ("cam_server.py", "generate_pwm.py"):
+    os.system("pkill -f " + _prog + " > /dev/null 2>&1")
+time.sleep(0.5)   # tempo al kernel per rilasciare le linee GPIO
+
+
+# "Stop" dal pannello = pkill = SIGTERM. Senza questo gestore Python
+# terminerebbe di colpo, lasciando i motori nell'ultimo stato (es. avanti!).
+# Cosi' invece viene eseguito Robot.chiudi(), che ferma i motori.
+def _su_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGTERM, _su_sigterm)
+
+
+# Precauzione GPIO (RPi.GPIO = rpi-lgpio su Bookworm/Trixie): un'uscita senza
+# 'initial' viene prima letta, e la lettura di un pin non ancora nostro fallisce.
+# Forziamo initial=LOW per tutte le uscite (anche quelle di util.init_gpio):
+# motori fermi all'avvio.
+_gpio_setup_originale = GPIO.setup
+
+
+def _gpio_setup_compat(canale, direzione, *args, **kwargs):
+    if direzione == GPIO.OUT and len(args) < 2 and kwargs.get('initial') is None:
+        kwargs['initial'] = GPIO.LOW
+    return _gpio_setup_originale(canale, direzione, *args, **kwargs)
+
+
+GPIO.setup = _gpio_setup_compat
+
+ut.init_gpio()
+
+# ---------------------------------------------------------------------------
+# Impostazioni di sistema (gli studenti non devono toccarle)
+# ---------------------------------------------------------------------------
+DIMENSIONI_FRAME = (640, 480)
+
+# Orientamento della camera. None = come il pannello di controllo: legge
+# "flip_RPI_cam" da earthrover/config.txt (voce "Orientation" del pannello).
+# Per forzarlo: "none", "rotate_180", "horizontal_flip", "vertical_flip".
+# Se l'immagine e' sottosopra, anche destra e sinistra sono invertite e il
+# robot sterza dalla parte sbagliata!
+ORIENTAMENTO_CAMERA = None
+SOGLIA_CONFIDENZA = 0.2          # minima "sicurezza" del modello per accettare un oggetto
+MAX_OGGETTI = 5                  # quanti oggetti al massimo considerare per frame
+# La persona da seguire deve avere almeno questa confidenza. Sotto, la rete
+# produce spesso riquadri "person" sbagliati o parziali (solo gambe, riflessi...)
+# che fanno saltare il robot da un riquadro all'altro. Tra piu' persone valide
+# viene scelta quella con la confidenza piu' alta.
+CONFIDENZA_PERSONA = 0.5
+
+# Log di ogni fotogramma: riga nel terminale e file CSV nella cartella log/
+# accanto a questo file (si apre con Excel / LibreOffice, separatore ';').
+LOG_TERMINALE = True
+LOG_CSV = True
+OGGETTO_DA_SEGUIRE = 'person'
+
+DIR_MODELLI = '/var/www/html/all_models'
+MODELLO = 'mobilenet_ssd_v2_coco_quant_postprocess.tflite'
+MODELLO_EDGETPU = 'mobilenet_ssd_v2_coco_quant_postprocess_edgetpu.tflite'
+ETICHETTE = 'coco_labels.txt'
+
+# Motori (IBT-2). La velocita' e' un PWM sugli ingressi RPWM/LPWM, cioe' sui
+# pin di direzione di util.py (m1_1/m1_2 e m2_1/m2_2): e' il modo standard di
+# pilotare l'IBT-2. Verso di marcia e quale ruota e' la sinistra vengono
+# ricavati da util.forward() e util.left(), identici al pannello di controllo.
+# Gli enable (R_EN + L_EN) restano sempre ALTI: funziona sia se sono collegati
+# ai GPIO qui sotto, sia se sono fissi a 5 V.
+PIN_ENABLE = (20, 21)            # GPIO degli enable (tenuti alti)
+FREQ_PWM = 100                   # Hz
+
+# Sotto una certa percentuale di PWM i motori ronzano ma non girano.
+# Le velocita' degli studenti (1..100) vengono "spalmate" tra PWM_MINIMO e 100:
+# cosi' anche velocita' basse muovono davvero il robot.
+# Il valore giusto si trova con prova_motori() (fase "rampa").
+PWM_MINIMO = 5                  # %
+
+# Rampa di accelerazione: a ogni comando la velocita' di una ruota puo'
+# cambiare al massimo di questi punti (con ~10 foto/s: da 0 a 30 in 0,3 s).
+# Evita gli scatti. La frenata (velocita' 0) invece e' sempre immediata.
+VARIAZIONE_MAX = 8
+
+VELOCITA_CURVA = 15              # velocita' usata da gira_sinistra()/gira_destra()
+
+PORTA_FLASK = 2204
+QUALITA_JPEG = 80
+
+
+# ---------------------------------------------------------------------------
+# Rete neurale (TensorFlow Lite / LiteRT, con o senza Coral)
+# Era common.py del progetto originale: ora e' qui dentro.
+# ---------------------------------------------------------------------------
+_LIB_EDGETPU = 'libedgetpu.so.1'
+
+# Un oggetto rilevato: classe, confidenza, riquadro normalizzato 0..1
+_Oggetto = collections.namedtuple('Oggetto', ['id', 'score', 'bbox'])
+_BBox = collections.namedtuple('BBox', ['xmin', 'ymin', 'xmax', 'ymax'])
+
+
+def _carica_etichette(percorso):
+    """coco_labels.txt -> {numero_classe: nome}, es. {0: 'person', ...}"""
+    riga_valida = re.compile(r'\s*(\d+)(.+)')
+    etichette = {}
+    with open(percorso, 'r', encoding='utf-8') as f:
+        for riga in f:
+            m = riga_valida.match(riga)
+            if m:
+                etichette[int(m.group(1))] = m.group(2).strip()
+    return etichette
+
+
+def _carica_modello(cartella, modello, file_etichette, usa_coral):
+    """Crea l'interprete TFLite (sul Coral se usa_coral == 1) e carica le etichette."""
+    percorso_modello = os.path.join(cartella, modello)
+    percorso_etichette = os.path.join(cartella, file_etichette)
+    print("Modello: {}  ({})".format(percorso_modello, "Coral" if usa_coral else "CPU"))
+
+    if usa_coral:
+        interprete = tflite.Interpreter(
+            model_path=percorso_modello,
+            experimental_delegates=[tflite.load_delegate(_LIB_EDGETPU, {})])
+    else:
+        interprete = tflite.Interpreter(model_path=percorso_modello)
+    interprete.allocate_tensors()
+    return interprete, _carica_etichette(percorso_etichette)
+
+
+def _imposta_ingresso(interprete, immagine_pil):
+    """Ridimensiona la foto alla dimensione di ingresso della rete e la copia dentro."""
+    _, altezza, larghezza, _ = interprete.get_input_details()[0]['shape']
+    immagine = immagine_pil.resize((larghezza, altezza), Image.NEAREST)
+    indice = interprete.get_input_details()[0]['index']
+    interprete.tensor(indice)()[0][:, :] = immagine
+
+
+def _tensore_uscita(interprete, i):
+    """Uscita i-esima della rete, riportata a numeri reali se quantizzata."""
+    dettagli = interprete.get_output_details()[i]
+    dati = np.squeeze(interprete.tensor(dettagli['index'])())
+    if 'quantization' not in dettagli:
+        return dati
+    scala, zero = dettagli['quantization']
+    if scala == 0:
+        return dati - zero
+    return scala * (dati - zero)
+
+
+def _leggi_oggetti(interprete, soglia, max_oggetti):
+    """Elenco degli oggetti rilevati con confidenza >= soglia (modello SSD MobileNet)."""
+    riquadri = _tensore_uscita(interprete, 0)
+    classi = _tensore_uscita(interprete, 1)
+    punteggi = _tensore_uscita(interprete, 2)
+    quanti = int(_tensore_uscita(interprete, 3))
+
+    oggetti = []
+    for i in range(min(max_oggetti, quanti)):
+        if punteggi[i] < soglia:
+            continue
+        ymin, xmin, ymax, xmax = riquadri[i]
+        oggetti.append(_Oggetto(
+            id=int(classi[i]),
+            score=float(punteggi[i]),
+            bbox=_BBox(xmin=max(0.0, float(xmin)), ymin=max(0.0, float(ymin)),
+                       xmax=min(1.0, float(xmax)), ymax=min(1.0, float(ymax)))))
+    return oggetti
+
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+_FLIP = {"none": (0, 0), "rotate_180": (1, 1),        # (hflip, vflip)
+         "horizontal_flip": (1, 0), "vertical_flip": (0, 1)}
+
+
+def _apri_camera():
+    """
+    Apre la camera CSI con Picamera2, orientata come nel pannello di controllo.
+    "RGB888" in Picamera2 = ordine BGR in memoria = compatibile OpenCV.
+    Il capovolgimento lo fa il sensore: non costa nulla per fotogramma.
+    """
+    from libcamera import Transform
+
+    if ORIENTAMENTO_CAMERA is not None:
+        orientamento, origine = ORIENTAMENTO_CAMERA, "ORIENTAMENTO_CAMERA nel toolkit"
+    elif hasattr(ut, "setting"):
+        orientamento, origine = ut.setting("flip_RPI_cam", "none"), "config.txt (pannello: Orientation)"
+    else:
+        orientamento, origine = "none", "predefinito"
+    if orientamento not in _FLIP:
+        print("Orientamento '{}' sconosciuto: uso 'none'".format(orientamento))
+        orientamento = "none"
+    h, v = _FLIP[orientamento]
+    print("Camera: orientamento '{}' (da {})".format(orientamento, origine))
+
+    camera = Picamera2(0)
+    config = camera.create_preview_configuration(
+        main={"size": DIMENSIONI_FRAME, "format": "RGB888"},
+        transform=Transform(hflip=h, vflip=v))
+    camera.configure(config)
+    camera.start()
+    time.sleep(1)   # lascia assestare esposizione e bilanciamento del bianco
+    return camera
+
+
+# ---------------------------------------------------------------------------
+# Motori: direzione e velocita' indipendenti per ruota sinistra e destra
+# ---------------------------------------------------------------------------
+def _livelli_di(funzione):
+    """
+    Esegue una funzione di util.py (es. ut.forward) SENZA toccare i pin:
+    restituisce i livelli {pin: True/False} che avrebbe impostato.
+    """
+    livelli = {}
+    originale = GPIO.output
+    GPIO.output = lambda canale, valore: livelli.__setitem__(canale, bool(valore))
+    try:
+        funzione()
+    finally:
+        GPIO.output = originale
+    return livelli
+
+
+class _Motori:
+    """
+    Pilota le due ruote separatamente.
+    Ogni ruota ha due ingressi sull'IBT-2 (pin di util.py):
+      AVANTI    -> PWM sul pin che util.forward() mette alto, l'altro a 0
+      INDIETRO  -> PWM sull'altro pin
+      FRENO     -> entrambi a 0 (con gli enable alti l'IBT-2 frena)
+    Valore di una ruota: da -100 (indietro a tutta) a +100 (avanti a tutta), 0 = freno.
+    """
+
+    def __init__(self):
+        # --- direzioni: le leggiamo da util.py, senza muovere nulla ---------
+        avanti = _livelli_di(ut.forward)
+        a_sinistra = _livelli_di(ut.left)
+        motore_1 = (ut.m1_1, ut.m1_2, 1)
+        motore_2 = (ut.m2_1, ut.m2_2, 2)
+        for pin_a, pin_b, n in (motore_1, motore_2):
+            if pin_a not in avanti or pin_b not in avanti or avanti[pin_a] == avanti[pin_b]:
+                raise RuntimeError(
+                    "util.forward() non imposta in modo valido i pin del motore {}".format(n))
+        # Per girare a sinistra util.left() manda INDIETRO la ruota sinistra:
+        # e' il motore che, rispetto a forward(), ha il verso invertito.
+        if a_sinistra.get(motore_1[0]) != avanti[motore_1[0]]:
+            sx, dx = motore_1, motore_2
+        else:
+            sx, dx = motore_2, motore_1
+
+        GPIO.setmode(GPIO.BCM)
+
+        # --- enable sempre alti -------------------------------------------
+        for pin in PIN_ENABLE:
+            GPIO.setup(pin, GPIO.OUT)
+            GPIO.output(pin, True)
+
+        # --- PWM sugli ingressi di direzione --------------------------------
+        # (pin "avanti", pin "indietro") per ogni ruota, ricavati da forward()
+        self._pwm = {}
+        self._pin_info = {}
+        for lato, (pin_a, pin_b, n) in (("sx", sx), ("dx", dx)):
+            pin_av, pin_ind = (pin_a, pin_b) if avanti[pin_a] else (pin_b, pin_a)
+            self._pwm[lato] = (GPIO.PWM(pin_av, FREQ_PWM), GPIO.PWM(pin_ind, FREQ_PWM))
+            self._pin_info[lato] = (n, pin_av, pin_ind)
+        for coppia in self._pwm.values():
+            for p in coppia:
+                p.start(0)
+
+        self.duty = {"sx": 0.0, "dx": 0.0}     # ultimo PWM applicato (per i log)
+        i_sx, i_dx = self._pin_info["sx"], self._pin_info["dx"]
+        self.descrizione = (
+            "Motori: SINISTRA = motore {} (avanti GPIO {}, indietro GPIO {})  |  "
+            "DESTRA = motore {} (avanti GPIO {}, indietro GPIO {})  |  "
+            "enable sempre alti su GPIO {}".format(
+                i_sx[0], i_sx[1], i_sx[2], i_dx[0], i_dx[1], i_dx[2],
+                "/".join(str(p) for p in PIN_ENABLE)))
+        print(self.descrizione)
+        self.ferma()
+
+    def ruota(self, lato, valore, grezzo=False):
+        """
+        Imposta una ruota. Con grezzo=True il valore e' il duty cycle PWM diretto
+        (serve alla prova dei motori), altrimenti passa per PWM_MINIMO.
+        Restituisce il valore effettivamente applicato (-100..100).
+        """
+        valore = max(-100.0, min(100.0, float(valore)))
+        pwm_av, pwm_ind = self._pwm[lato]
+
+        if abs(valore) < 1:
+            # freno: entrambi gli ingressi bassi (enable alti)
+            pwm_av.ChangeDutyCycle(0)
+            pwm_ind.ChangeDutyCycle(0)
+            self.duty[lato] = 0.0
+            return 0.0
+
+        if grezzo:
+            duty = abs(valore)
+        else:
+            duty = PWM_MINIMO + (100 - PWM_MINIMO) * abs(valore) / 100
+
+        if valore > 0:
+            pwm_ind.ChangeDutyCycle(0)
+            pwm_av.ChangeDutyCycle(duty)
+        else:
+            pwm_av.ChangeDutyCycle(0)
+            pwm_ind.ChangeDutyCycle(duty)
+        self.duty[lato] = duty
+        return valore
+
+    def muovi(self, sinistra, destra):
+        return self.ruota("sx", sinistra), self.ruota("dx", destra)
+
+    def ferma(self):
+        self.muovi(0, 0)
+
+    def spegni(self):
+        """Uscita: freno, poi PWM fermati, ingressi ed enable bassi."""
+        try:
+            self.ferma()
+            time.sleep(0.05)
+        finally:
+            for coppia in self._pwm.values():
+                for p in coppia:
+                    try:
+                        p.ChangeDutyCycle(0)
+                        p.stop()
+                    except Exception:
+                        pass
+            try:
+                ut.stop()
+            except Exception:
+                pass
+            for pin in PIN_ENABLE:
+                try:
+                    GPIO.output(pin, False)
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Cio' che il robot "vede": una persona
+# ---------------------------------------------------------------------------
+@dataclass
+class Persona:
+    """
+    Descrive la persona rilevata nel fotogramma.
+
+    Tutte le coordinate sono NORMALIZZATE tra 0 e 1:
+      x: 0 = bordo sinistro dell'immagine, 1 = bordo destro
+      y: 0 = bordo ALTO dell'immagine,     1 = bordo BASSO  (l'asse y va verso il basso!)
+    """
+    x_centro: float      # centro orizzontale della persona
+    y_centro: float      # centro verticale della persona
+    errore_x: float      # 0.5 - x_centro: > 0 persona a SINISTRA, < 0 persona a DESTRA, 0 = centrata
+    basso: float         # y del bordo inferiore (i "piedi"): piu' e' vicino a 1, piu' la persona e' vicina
+    altezza: float       # altezza del riquadro (0..1): una persona vicina appare grande
+    larghezza: float     # larghezza del riquadro (0..1): anche questa cresce avvicinandosi
+    area: float          # parte dell'immagine occupata dal riquadro (altezza x larghezza):
+                         # 0.05 = persona piccola e lontana, 0.8 = riempie quasi tutto
+    confidenza: float    # sicurezza del modello (0..1)
+    bbox: tuple          # (x_min, y_min, x_max, y_max), usato per il disegno
+
+
+# ---------------------------------------------------------------------------
+# Streaming Flask (interno)
+# ---------------------------------------------------------------------------
+class _BufferStream:
+    """Tiene l'ultimo JPEG prodotto; i client Flask lo leggono appena e' nuovo."""
+
+    def __init__(self):
+        self.cond = Condition()
+        self.jpeg = None
+        self.frame_id = 0
+        self.clients = 0
+        self.chiuso = False
+
+    def pubblica(self, jpeg):
+        with self.cond:
+            self.jpeg = jpeg
+            self.frame_id += 1
+            self.cond.notify_all()
+
+    def attendi(self, ultimo_id, timeout=2.0):
+        with self.cond:
+            self.cond.wait_for(
+                lambda: self.frame_id != ultimo_id or self.chiuso, timeout=timeout)
+            if self.chiuso or self.frame_id == ultimo_id:
+                return ultimo_id, None
+            return self.frame_id, self.jpeg
+
+    def aggiungi_client(self):
+        with self.cond:
+            self.clients += 1
+
+    def rimuovi_client(self):
+        with self.cond:
+            self.clients = max(0, self.clients - 1)
+
+    def ha_client(self):
+        return self.clients > 0
+
+    def chiudi(self):
+        with self.cond:
+            self.chiuso = True
+            self.cond.notify_all()
+
+
+_stream = _BufferStream()
+_app = Flask(__name__)
+
+_PAGINA = """<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot inseguitore</title>
+<style>
+ body{margin:0;background:#111;color:#eee;font-family:sans-serif;text-align:center}
+ h1{font-size:1.1rem;padding:10px;margin:0}
+ img{max-width:100%;height:auto;border:1px solid #444}
+</style></head>
+<body><h1>Robot inseguitore - vista della camera</h1>
+<img src="/video_feed" alt="vista del robot"></body></html>"""
+
+
+# endpoint espliciti: i nomi 'index' e 'video_feed' sono quelli che
+# templates/index.html del progetto originale usa con url_for(...)
+@_app.route('/', endpoint='index')
+def _index():
+    try:
+        return render_template("index.html")
+    except Exception as e:   # template assente o non compatibile
+        print("templates/index.html non utilizzabile ({}): uso la pagina integrata".format(e))
+        return _PAGINA
+
+
+def _genera_mjpeg():
+    _stream.aggiungi_client()
+    ultimo = -1
+    try:
+        while True:
+            ultimo, jpeg = _stream.attendi(ultimo)
+            if _stream.chiuso:
+                break
+            if jpeg is None:
+                continue
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n\r\n')
+    finally:
+        _stream.rimuovi_client()
+
+
+@_app.route('/video_feed', endpoint='video_feed')
+def _video_feed():
+    return Response(_genera_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def _ip_locale():
+    """IP del robot sulla LAN (nessun pacchetto viene davvero inviato)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "<ip-del-robot>"
+    finally:
+        s.close()
+
+
+def _avvia_flask(porta):
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)
+
+    def _esegui():
+        try:
+            _app.run(host='0.0.0.0', port=porta, threaded=True, use_reloader=False)
+        except Exception as e:
+            print("\n*** Flask NON avviato sulla porta {}: {}".format(porta, e))
+            print("*** Probabilmente la porta e' gia' usata da un altro programma.")
+            print("*** Controlla con:  sudo ss -ltnp | grep {}\n".format(porta))
+
+    t = Thread(target=_esegui, daemon=True)
+    t.start()
+    time.sleep(0.5)
+    if t.is_alive():
+        print("\n>>> Video del robot:  http://{}:{}/\n".format(_ip_locale(), porta))
+
+
+# ---------------------------------------------------------------------------
+# Overlay video: stesso layout di append_text_img1 del progetto originale
+# ---------------------------------------------------------------------------
+def _disegna_overlay(cv2_im, oggetti, etichette, dur, persona, cmd, vel,
+                     tolleranza, soglia_vicino):
+    height, width = cv2_im.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    # barra nera in alto
+    cv2_im = cv2.rectangle(cv2_im, (0, 0), (width, 24), (0, 0, 0), -1)
+
+    # durate di elaborazione
+    cam = int(round(dur[0] * 1000))
+    inference = int(round(dur[1] * 1000))
+    other = int(round(dur[2] * 1000))
+    text_dur = 'Camera: {}ms   Inference: {}ms   other: {}ms'.format(cam, inference, other)
+    cv2_im = cv2.putText(cv2_im, text_dur, (int(width / 4) - 30, 16), font, 0.4, (255, 255, 255), 1)
+
+    # FPS
+    total = cam + inference + other
+    fps = round(1000 / total, 1) if total else 0.0
+    cv2_im = cv2.putText(cv2_im, 'FPS: {}'.format(fps), (10, 20), font, 0.7, (150, 150, 255), 2)
+
+    # barra nera in basso
+    cv2_im = cv2.rectangle(cv2_im, (0, height - 24), (width, height), (0, 0, 0), -1)
+
+    # tolleranza e deviazioni
+    cv2_im = cv2.putText(cv2_im, 'Tol : {}'.format(tolleranza), (10, height - 8),
+                         font, 0.55, (150, 150, 255), 2)
+
+    x_dev = persona.errore_x if persona else 0.0
+    color_x = (0, 255, 0) if abs(x_dev) < tolleranza else (0, 0, 255)
+    cv2_im = cv2.putText(cv2_im, 'X: {:+.2f}'.format(x_dev), (110, height - 8),
+                         font, 0.55, color_x, 2)
+
+    # area occupata dalla persona: diventa verde quando supera la soglia di arrivo
+    area = persona.area if persona else 0.0
+    color_a = (0, 255, 0) if area > soglia_vicino else (0, 0, 255)
+    cv2_im = cv2.putText(cv2_im, 'A: {:.2f}'.format(area), (220, height - 8),
+                         font, 0.55, color_a, 2)
+
+    # comando, velocita' e stato
+    cv2_im = cv2.putText(cv2_im, str(cmd), (int(width / 2) + 10, height - 8),
+                         font, 0.68, (0, 255, 255), 2)
+    # velocita' delle due ruote (sinistra / destra)
+    str_sp = 'L {:.0f}%  R {:.0f}%'.format(vel[0], vel[1])
+    cv2_im = cv2.putText(cv2_im, str_sp, (int(width / 2) + 165, height - 8),
+                         font, 0.55, (150, 150, 255), 2)
+
+    if cmd == 0:
+        stato = "No object"
+    elif cmd == 'Stop':
+        stato = 'Acquired'
+    else:
+        stato = 'Tracking'
+    cv2_im = cv2.putText(cv2_im, stato, (width - 140, 18), font, 0.7, (0, 255, 255), 2)
+
+    # croce centrale
+    cv2_im = cv2.rectangle(cv2_im, (0, int(height / 2) - 1), (width, int(height / 2) + 1), (255, 0, 0), -1)
+    cv2_im = cv2.rectangle(cv2_im, (int(width / 2) - 1, 0), (int(width / 2) + 1, height), (255, 0, 0), -1)
+
+    # punto rosso al centro della persona
+    if persona:
+        cv2_im = cv2.circle(cv2_im, (int(persona.x_centro * width), int(persona.y_centro * height)),
+                            7, (0, 0, 255), -1)
+
+    # fascia di tolleranza
+    cv2_im = cv2.rectangle(cv2_im, (int(width / 2 - tolleranza * width), 0),
+                           (int(width / 2 + tolleranza * width), height), (0, 255, 0), 2)
+
+    # riquadri delle persone
+    for obj in oggetti:
+        nome = etichette.get(obj.id, obj.id)
+        if nome != "person":
+            continue
+        x0, y0, x1, y1 = list(obj.bbox)
+        x0, y0, x1, y1 = int(x0 * width), int(y0 * height), int(x1 * width), int(y1 * height)
+        testo = '{}% {}'.format(int(100 * obj.score), nome)
+        cv2_im = cv2.rectangle(cv2_im, (x0, y0), (x1, y1), (0, 150, 255), 1)
+        cv2_im = cv2.putText(cv2_im, testo, (x0, y1 - 5), font, 0.5, (0, 255, 0), 1)
+
+    # la persona scelta da seguire: riquadro verde spesso
+    # (i riquadri arancioni sottili senza verde sono quelli scartati)
+    if persona:
+        x0, y0, x1, y1 = persona.bbox
+        cv2_im = cv2.rectangle(cv2_im, (int(x0 * width), int(y0 * height)),
+                               (int(x1 * width), int(y1 * height)), (0, 255, 0), 3)
+
+    return cv2_im
+
+
+# ---------------------------------------------------------------------------
+# Il robot
+# ---------------------------------------------------------------------------
+class Robot:
+    """
+    Occhi:   cerca_persona()
+    Gambe:   muovi(sinistra, destra)   velocita' delle due ruote, da -100 a 100
+             ferma()
+             avanti(velocita), gira_sinistra(secondi), gira_destra(secondi)
+    Video:   mostra(azione, tolleranza, soglia_vicino)
+    Ciclo:   attivo()   -> False quando si preme 'q' nella finestra di anteprima
+    """
+
+    def __init__(self, finestra=True, porta=PORTA_FLASK):
+        # senza display (es. avvio dal pannello web o via SSH senza -X) niente finestra:
+        # Qt in quel caso termina il programma invece di dare un errore gestibile
+        if finestra and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            print("Nessun display: anteprima locale disattivata, video solo via web")
+            finestra = False
+
+        self._finestra = finestra
+        self._attivo = True
+        self._frame = None
+        self._oggetti = []
+        self._persona = None
+        self._dur = [0.0, 0.0, 0.0]     # camera, inferenza, altro (secondi)
+        self._fine_inferenza = time.time()
+        self._cmd = 0                   # comando da mostrare nel video
+        self._vel = (0.0, 0.0)          # velocita' applicate (sinistra, destra)
+        self._motori = None
+        self._persone = []              # tutte le persone viste: (confidenza, bbox)
+        self._n_frame = 0
+        self._t_frame_prec = time.time()
+        self._fps = 0.0
+        self._csv = None
+
+        # 1) modello (e' il passo piu' probabile a fallire: lo facciamo per primo,
+        #    quando i motori sono ancora spenti)
+        nome_modello = MODELLO_EDGETPU if edgetpu == 1 else MODELLO
+        self._interprete, self._etichette = _carica_modello(
+            DIR_MODELLI, nome_modello, ETICHETTE, edgetpu)
+
+        # 2) camera, con lo stesso orientamento del pannello di controllo
+        self._camera = _apri_camera()
+
+        # 3) motori: abilitati SOLO ora che tutto il resto e' pronto
+        self._motori = _Motori()
+
+        # 4) streaming video
+        _avvia_flask(porta)
+
+        # 5) file di log
+        if LOG_CSV:
+            self._apri_csv()
+
+    # ----- log ----------------------------------------------------------------
+    _COLONNE_CSV = ["ora", "frame", "fps", "camera_ms", "inferenza_ms",
+                    "persone_viste", "persone (conf/basso/altezza)",
+                    "scelta_conf", "x_centro", "errore_x", "basso", "altezza", "larghezza", "area",
+                    "azione", "comando", "vel_sx", "vel_dx", "pwm_sx", "pwm_dx"]
+
+    def _apri_csv(self):
+        try:
+            cartella = os.path.join(os.path.dirname(os.path.realpath(__file__)), "log")
+            os.makedirs(cartella, exist_ok=True)
+            nome = os.path.join(cartella, datetime.now().strftime("inseguitore_%Y%m%d_%H%M%S.csv"))
+            self._csv = open(nome, "w", encoding="utf-8")
+            self._csv.write(";".join(self._COLONNE_CSV) + "\n")
+            self._csv.flush()
+            print(">>> Log CSV:", nome)
+        except OSError as e:
+            print("Log CSV disattivato:", e)
+            self._csv = None
+
+    @staticmethod
+    def _num(v, cifre=3):
+        """Numero per il CSV con la virgola decimale (Excel/LibreOffice in italiano)."""
+        return "{:.{}f}".format(v, cifre).replace(".", ",")
+
+    def _registra(self, azione):
+        p = self._persona
+        sx, dx = self._vel
+        duty = self._motori.duty if self._motori else {"sx": 0, "dx": 0}
+        cam_ms, inf_ms = int(self._dur[0] * 1000), int(self._dur[1] * 1000)
+        persone_txt = " ".join("[{:.2f} b{:.2f} h{:.2f}]".format(c, b[3], b[3] - b[1])
+                               for c, b in self._persone) or "-"
+
+        if LOG_TERMINALE:
+            if p:
+                scelta = "conf {:.2f} errore_x {:+.2f} AREA {:.2f} (alt {:.2f} larg {:.2f} basso {:.2f})".format(
+                    p.confidenza, p.errore_x, p.area, p.altezza, p.larghezza, p.basso)
+            else:
+                scelta = "nessuna persona valida (conf >= {})".format(CONFIDENZA_PERSONA)
+            print("#{:5d} {:4.1f}fps cam {:3d}ms inf {:3d}ms | persone {} | {} | {} | "
+                  "L {:3.0f}% R {:3.0f}% (PWM {:3.0f}/{:3.0f})".format(
+                      self._n_frame, self._fps, cam_ms, inf_ms, persone_txt, scelta,
+                      azione, sx, dx, duty["sx"], duty["dx"]))
+
+        if self._csv:
+            n = self._num
+            riga = [datetime.now().strftime("%H:%M:%S.%f")[:-3], str(self._n_frame),
+                    n(self._fps, 1), str(cam_ms), str(inf_ms),
+                    str(len(self._persone)), persone_txt.replace(".", ",")]
+            if p:
+                riga += [n(p.confidenza, 2), n(p.x_centro), n(p.errore_x), n(p.basso),
+                         n(p.altezza), n(p.larghezza), n(p.area)]
+            else:
+                riga += [""] * 7
+            riga += [str(azione).replace(";", ","), str(self._cmd),
+                     n(sx, 0), n(dx, 0), n(duty["sx"], 0), n(duty["dx"], 0)]
+            try:
+                self._csv.write(";".join(riga) + "\n")
+                self._csv.flush()
+            except OSError:
+                pass
+
+    # ----- gestione del ciclo di vita -------------------------------------
+    def __enter__(self):
+        return self
+
+    def __exit__(self, tipo, valore, traceback):
+        self.chiudi()
+        return tipo is KeyboardInterrupt   # Ctrl+C = uscita pulita, senza errori
+
+    def attivo(self):
+        return self._attivo
+
+    def chiudi(self):
+        """Ferma i motori e rilascia camera e finestre. Sicuro da chiamare piu' volte."""
+        try:
+            if self._motori is not None:
+                self._motori.spegni()
+            else:
+                ut.stop()
+        finally:
+            _stream.chiudi()
+            try:
+                self._camera.stop()
+                self._camera.close()
+            except Exception:
+                pass
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+            if self._csv:
+                try:
+                    self._csv.close()
+                except OSError:
+                    pass
+                self._csv = None
+
+    # ----- occhi ------------------------------------------------------------
+    def cerca_persona(self):
+        """
+        Scatta una foto, la passa alla rete neurale e restituisce la persona
+        piu' sicura (oggetto Persona) oppure None se non c'e' nessuno.
+        """
+        adesso = time.time()
+        dt = adesso - self._t_frame_prec
+        self._fps = 1.0 / dt if dt > 0 else 0.0
+        self._t_frame_prec = adesso
+        self._n_frame += 1
+
+        t0 = time.time()
+        frame = self._camera.capture_array()
+        self._frame = frame
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        self._dur[0] = time.time() - t0
+
+        t1 = time.time()
+        _imposta_ingresso(self._interprete, pil)
+        self._interprete.invoke()
+        self._oggetti = _leggi_oggetti(
+            self._interprete, soglia=SOGLIA_CONFIDENZA, max_oggetti=MAX_OGGETTI)
+        self._fine_inferenza = time.time()
+        self._dur[1] = self._fine_inferenza - t1
+
+        # tutte le persone viste (per i log). float(): il modello restituisce
+        # numpy.float32, che time.sleep() di Python 3.13 non accetta.
+        self._persone = []
+        for obj in self._oggetti:
+            if self._etichette.get(obj.id, obj.id) == OGGETTO_DA_SEGUIRE:
+                bbox = tuple(min(1.0, max(0.0, float(v))) for v in obj.bbox)
+                self._persone.append((float(obj.score), bbox))
+        self._persone.sort(key=lambda pb: pb[0], reverse=True)
+
+        # la persona da seguire: la piu' sicura, se supera CONFIDENZA_PERSONA
+        self._persona = None
+        if self._persone and self._persone[0][0] >= CONFIDENZA_PERSONA:
+            score, (x_min, y_min, x_max, y_max) = self._persone[0]
+            x_centro = round((x_min + x_max) / 2, 3)
+            y_centro = round((y_min + y_max) / 2, 3)
+            self._persona = Persona(
+                x_centro=x_centro,
+                y_centro=y_centro,
+                errore_x=round(0.5 - x_centro, 3),
+                basso=round(y_max, 3),
+                altezza=round(y_max - y_min, 3),
+                larghezza=round(x_max - x_min, 3),
+                area=round((x_max - x_min) * (y_max - y_min), 3),
+                confidenza=round(score, 2),
+                bbox=(x_min, y_min, x_max, y_max))
+
+        return self._persona
+
+    # ----- gambe ------------------------------------------------------------
+    def muovi(self, sinistra, destra):
+        """
+        Imposta la velocita' delle due ruote, da -100 (indietro) a 100 (avanti).
+        Il comando resta attivo finche' non ne arriva un altro: non blocca.
+          muovi(50, 50)  -> dritto a meta' velocita'
+          muovi(30, 70)  -> avanti curvando a SINISTRA (la ruota destra va piu' veloce)
+          muovi(0, 0)    -> fermo
+        Le variazioni di velocita' sono addolcite (VARIAZIONE_MAX per comando);
+        la frenata invece e' immediata.
+        """
+        nuove = []
+        for attuale, richiesta in zip(self._vel, (sinistra, destra)):
+            richiesta = max(-100.0, min(100.0, float(richiesta)))
+            if abs(richiesta) < 1:
+                nuove.append(0.0)                          # frenata: subito
+            else:
+                passo = max(-VARIAZIONE_MAX, min(VARIAZIONE_MAX, richiesta - attuale))
+                nuove.append(attuale + passo)
+        self._vel = self._motori.muovi(*nuove)
+        sx, dx = self._vel
+        if sx == 0 and dx == 0:
+            self._cmd = "Stop"
+        elif dx - sx > 5:
+            self._cmd = "Move Left"
+        elif sx - dx > 5:
+            self._cmd = "Move Right"
+        else:
+            self._cmd = "forward"
+
+    def ferma(self):
+        self.muovi(0, 0)
+
+    def avanti(self, velocita=100):
+        """Dritto alla velocita' indicata finche' non arriva un altro comando."""
+        self.muovi(velocita, velocita)
+
+    def gira_sinistra(self, secondi):
+        """Rotazione sul posto a sinistra per 'secondi', poi si ferma."""
+        self._vel = self._motori.muovi(-VELOCITA_CURVA, VELOCITA_CURVA)
+        time.sleep(float(secondi))
+        self.ferma()
+        self._cmd = "Move Left"
+
+    def gira_destra(self, secondi):
+        """Rotazione sul posto a destra per 'secondi', poi si ferma."""
+        self._vel = self._motori.muovi(VELOCITA_CURVA, -VELOCITA_CURVA)
+        time.sleep(float(secondi))
+        self.ferma()
+        self._cmd = "Move Right"
+
+    # ----- video ------------------------------------------------------------
+    def mostra(self, azione="", tolleranza=0.1, soglia_vicino=0.9):
+        """
+        Disegna sul fotogramma quello che il robot ha capito (stesso layout del
+        progetto originale) e lo mostra nella finestra locale e sulla pagina web.
+          azione         : descrizione dell'azione scelta (finisce nei log)
+          tolleranza     : larghezza della fascia centrale (riquadro verde)
+          soglia_vicino  : soglia di arrivo (la "A" diventa verde quando l'area la supera)
+        """
+        if self._frame is None:
+            return
+
+        self._dur[2] = time.time() - self._fine_inferenza
+
+        self._registra(azione)
+
+        cmd =0 if self._persona is None else (self._cmd or "Stop")
+
+        img = _disegna_overlay(self._frame.copy(), self._oggetti, self._etichette,
+                               self._dur, self._persona, cmd, self._vel,
+                               tolleranza, soglia_vicino)
+
+        # finestra locale
+        if self._finestra:
+            try:
+                cv2.imshow("Robot inseguitore", img)
+                if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                    self._attivo = False
+            except cv2.error as e:
+                print("Anteprima locale disattivata:", e)
+                self._finestra = False
+
+        # stream web: lavoriamo solo se qualcuno sta guardando
+        if _stream.ha_client():
+            ok, jpeg = cv2.imencode('.jpg', img,
+                                    [cv2.IMWRITE_JPEG_QUALITY, QUALITA_JPEG])
+            if ok:
+                _stream.pubblica(jpeg.tobytes())
+
+
+# ===========================================================================
+# PROVE DELL'HARDWARE
+#
+#   import robot_toolkit as rt
+#   rt.prova_camera()       -> solo l'immagine della camera       (motori spenti)
+#   rt.prova_detection()    -> camera + TUTTE le detection         (motori spenti)
+#   rt.prova_motori()       -> ruota sinistra, ruota destra, rampa di PWM
+#                              (ROBOT SOLLEVATO, ruote libere!)
+#
+# Video nella finestra locale (se c'e' un display) e sulla pagina web
+# (porta 2204). Uscita: 'q' nella finestra oppure Ctrl+C.
+# ===========================================================================
+
+
+def prova_motori(lenta=20, veloce=100, secondi=3.0, passo_rampa=5):
+    """
+    Verifica dei motori. SOLLEVA IL ROBOT: le ruote devono girare a vuoto.
+      1) entrambe AVANTI, SINISTRA piano e DESTRA veloce
+      2) entrambe AVANTI, SINISTRA veloce e DESTRA piano
+         -> una ruota va all'indietro        : inverti M+ e M- di quel motore
+         -> la ruota "piano" non gira        : alza PWM_MINIMO
+      3) rampa di PWM su entrambe (0 -> 100%): annota la % a cui le ruote
+         iniziano DAVVERO a girare e mettila in PWM_MINIMO
+    """
+    print("\nPROVA MOTORI - solleva il robot! Inizio tra 3 secondi (Ctrl+C per annullare)")
+    time.sleep(3)
+    motori = _Motori()
+    try:
+        print("\n1) Entrambe AVANTI:  SINISTRA PIANO  -  DESTRA VELOCE")
+        motori.muovi(lenta, veloce)
+        time.sleep(secondi)
+        motori.ferma()
+        time.sleep(1)
+
+        print("2) Entrambe AVANTI:  SINISTRA VELOCE  -  DESTRA PIANO")
+        motori.muovi(veloce, lenta)
+        time.sleep(secondi)
+        motori.ferma()
+        time.sleep(1)
+
+        print("   Una ruota gira all'indietro     -> inverti M+ e M- su quell'IBT-2")
+        print("   Stessa velocita' su entrambe    -> controlla RPWM/LPWM sui GPIO di util.py")
+        print("   La ruota 'piano' non gira       -> alza PWM_MINIMO (vedi rampa)")
+
+        print("\n3) Rampa: annota la percentuale a cui le ruote iniziano a girare")
+        for duty in range(passo_rampa, 101, passo_rampa):
+            motori.ruota("sx", duty, grezzo=True)
+            motori.ruota("dx", duty, grezzo=True)
+            print("   PWM {:3d}%".format(duty))
+            time.sleep(0.8)
+        motori.ferma()
+        print("\nFine. Valore attuale di PWM_MINIMO: {}%".format(PWM_MINIMO))
+    except KeyboardInterrupt:
+        print("\nProva motori interrotta")
+    finally:
+        motori.spegni()
+
+# un colore fisso per ogni classe (stessa classe = stesso colore), formato BGR
+_PROVA_COLORI = [(0, 255, 0), (255, 128, 0), (0, 128, 255), (255, 0, 255),
+                 (0, 255, 255), (255, 255, 0), (128, 0, 255), (0, 0, 255),
+                 (255, 0, 128), (128, 255, 0)]
+
+
+def _prova_finestra_disponibile(finestra):
+    if finestra and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        print("Nessun display: anteprima locale disattivata, video solo via web")
+        return False
+    return finestra
+
+
+def _prova_apri_camera():
+    return _apri_camera()
+
+
+def _prova_chiudi(camera):
+    _stream.chiudi()
+    try:
+        camera.stop()
+        camera.close()
+    except Exception:
+        pass
+    try:
+        cv2.destroyAllWindows()
+    except cv2.error:
+        pass
+    print("Prova terminata")
+
+
+def _prova_scritta(img, testo, pos, colore=(255, 255, 255), scala=0.55):
+    """Testo con contorno nero, leggibile su qualunque sfondo."""
+    cv2.putText(img, testo, pos, cv2.FONT_HERSHEY_SIMPLEX, scala, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(img, testo, pos, cv2.FONT_HERSHEY_SIMPLEX, scala, colore, 1, cv2.LINE_AA)
+
+
+def _prova_mostra(img, titolo, stato):
+    """Finestra locale + stream web. Restituisce False se e' stato premuto 'q'."""
+    continua = True
+    if stato["finestra"]:
+        try:
+            cv2.imshow(titolo, img)
+            if (cv2.waitKey(1) & 0xFF) == ord('q'):
+                continua = False
+        except cv2.error as e:
+            print("Anteprima locale disattivata:", e)
+            stato["finestra"] = False
+    if _stream.ha_client():
+        ok, jpeg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, QUALITA_JPEG])
+        if ok:
+            _stream.pubblica(jpeg.tobytes())
+    return continua
+
+
+def prova_camera(finestra=True, porta=PORTA_FLASK):
+    """Mostra solo l'immagine della camera con risoluzione e FPS. Niente modello, niente motori."""
+    stato = {"finestra": _prova_finestra_disponibile(finestra)}
+    camera = _prova_apri_camera()
+    _avvia_flask(porta)
+    print("PROVA CAMERA avviata  ('q' nella finestra o Ctrl+C per uscire)")
+
+    t_prec = time.time()
+    try:
+        while True:
+            img = camera.capture_array()
+            adesso = time.time()
+            fps = 1.0 / (adesso - t_prec) if adesso > t_prec else 0.0
+            t_prec = adesso
+
+            h, w = img.shape[:2]
+            _prova_scritta(img, "PROVA CAMERA", (8, 22), (0, 255, 255), 0.65)
+            _prova_scritta(img, "{}x{}   FPS {:.1f}".format(w, h, fps), (8, h - 10))
+
+            if not _prova_mostra(img, "Prova camera", stato):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _prova_chiudi(camera)
+
+
+def prova_detection(soglia=SOGLIA_CONFIDENZA, max_oggetti=10, finestra=True, porta=PORTA_FLASK):
+    """
+    Camera + rete neurale: disegna TUTTI gli oggetti riconosciuti (non solo le
+    persone) con nome e confidenza. Niente motori.
+      soglia      : confidenza minima per mostrare un oggetto (0..1)
+      max_oggetti : quanti oggetti al massimo per fotogramma
+    Nel terminale viene stampato l'elenco degli oggetti visti quando cambia.
+    """
+    stato = {"finestra": _prova_finestra_disponibile(finestra)}
+
+    nome_modello = MODELLO_EDGETPU if edgetpu == 1 else MODELLO
+    backend = "Coral" if edgetpu == 1 else "CPU"
+    interprete, etichette = _carica_modello(DIR_MODELLI, nome_modello, ETICHETTE, edgetpu)
+
+    camera = _prova_apri_camera()
+    _avvia_flask(porta)
+    print("PROVA DETECTION avviata su {}  ('q' nella finestra o Ctrl+C per uscire)".format(backend))
+
+    ultimo_elenco = None
+    t_prec = time.time()
+    try:
+        while True:
+            t0 = time.time()
+            img = camera.capture_array()
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            t_cam = time.time() - t0
+
+            t1 = time.time()
+            _imposta_ingresso(interprete, pil)
+            interprete.invoke()
+            oggetti = _leggi_oggetti(interprete, soglia=soglia, max_oggetti=max_oggetti)
+            t_inf = time.time() - t1
+
+            adesso = time.time()
+            fps = 1.0 / (adesso - t_prec) if adesso > t_prec else 0.0
+            t_prec = adesso
+
+            h, w = img.shape[:2]
+            nomi = []
+            for obj in oggetti:
+                nome = str(etichette.get(obj.id, obj.id))
+                nomi.append(nome)
+                colore = _PROVA_COLORI[int(obj.id) % len(_PROVA_COLORI)]
+
+                x0, y0, x1, y1 = (float(v) for v in obj.bbox)
+                p0 = (max(0, int(x0 * w)), max(0, int(y0 * h)))
+                p1 = (min(w - 1, int(x1 * w)), min(h - 1, int(y1 * h)))
+                cv2.rectangle(img, p0, p1, colore, 2)
+
+                etichetta = "{} {}%".format(nome, int(float(obj.score) * 100))
+                (tw, th), _ = cv2.getTextSize(etichetta, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                ty = max(p0[1], th + 4)
+                cv2.rectangle(img, (p0[0], ty - th - 4), (p0[0] + tw + 4, ty), colore, -1)
+                cv2.putText(img, etichetta, (p0[0] + 2, ty - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+            _prova_scritta(img, "PROVA DETECTION - {}".format(backend), (8, 22), (0, 255, 255), 0.65)
+            _prova_scritta(img, "Camera {}ms  Inferenza {}ms  FPS {:.1f}  oggetti {}  soglia {}".format(
+                int(t_cam * 1000), int(t_inf * 1000), fps, len(oggetti), soglia), (8, h - 10), scala=0.5)
+
+            elenco = ", ".join(sorted(nomi)) if nomi else "nessun oggetto"
+            if elenco != ultimo_elenco:
+                print("Visti:", elenco)
+                ultimo_elenco = elenco
+
+            if not _prova_mostra(img, "Prova detection", stato):
+                break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _prova_chiudi(camera)
